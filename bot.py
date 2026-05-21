@@ -153,12 +153,31 @@ class TikTokLiveBot:
             self.logger.error(f"Error downloading live from {username}: {e}")
             return None
     
-    def download_live_sync(self, username: str, chat_id: int = None) -> str:
-        """Synchronous wrapper for download_live (runs in thread)"""
+    def download_live_blocking(self, username: str, chat_id: int = None) -> str:
+        """Blocking version for download_live (runs in thread)"""
         try:
-            return asyncio.run(self.download_live(username, chat_id))
+            url = f"https://www.tiktok.com/@{username}/live"
+            
+            ydl_opts = {
+                'format': 'best',
+                'quiet': False,
+                'no_warnings': False,
+                'outtmpl': f'downloads/%(username)s_%(id)s.%(ext)s',
+                'socket_timeout': 10,
+                'fragment_timeout': 10,
+            }
+            
+            os.makedirs('downloads', exist_ok=True)
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                self.logger.info(f"Starting download for {username}...")
+                info = ydl.extract_info(url, download=True)
+                filepath = ydl.prepare_filename(info)
+                self.logger.info(f"Downloaded: {filepath}")
+                return filepath
+        
         except Exception as e:
-            self.logger.error(f"Error in download_live_sync: {e}")
+            self.logger.error(f"Error downloading live from {username}: {e}")
             return None
 
 # Initialize bot
@@ -349,7 +368,7 @@ async def download_live_command(update: Update, context: ContextTypes.DEFAULT_TY
     # Function to run download in thread
     def run_download():
         try:
-            filepath = bot.download_live_sync(username, chat_id)
+            filepath = bot.download_live_blocking(username, chat_id)
             active_downloads[chat_id]['filepath'] = filepath
             active_downloads[chat_id]['completed'] = True
         except Exception as e:
