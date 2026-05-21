@@ -1,0 +1,16 @@
+{
+  "accounts": [
+    {
+      "username": "tiktok_user1",
+      "user_id": "1234567890",
+      "added_date": "2024-01-01",
+      "last_checked": null,
+      "is_live": false
+    }
+  ],
+  "settings": {
+    "check_interval": 300,
+    "max_retries": 3,
+    "timeout": 30
+  }
+}

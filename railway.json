@@ -1,0 +1,23 @@
+{
+  "build": {
+    "builder": "python"
+  },
+  "deploy": {
+    "startCommand": "python bot.py",
+    "environmentVariables": {
+      "TELEGRAM_BOT_TOKEN": {
+        "description": "Your Telegram Bot Token from @BotFather"
+      },
+      "TELEGRAM_CHAT_ID": {
+        "description": "Your Telegram Chat ID"
+      },
+      "DATABASE_URL": {
+        "description": "Neon PostgreSQL connection URL"
+      },
+      "LOG_LEVEL": {
+        "value": "INFO",
+        "description": "Logging level (DEBUG, INFO, WARNING, ERROR)"
+      }
+    }
+  }
+}
