@@ -127,7 +127,7 @@ class TikTokDatabase:
                     'id': acc['id'],
                     'username': acc['username'],
                     'user_id': acc['user_id'],
-                    'added_date': acc['added_date"],
+                    'added_date': acc['added_date'],
                     'last_checked': acc['last_checked'],
                     'is_live': acc['is_live']
                 } for acc in accounts

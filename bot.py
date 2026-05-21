@@ -24,6 +24,19 @@ from database import TikTokDatabase
 # Load environment variables
 load_dotenv()
 
+# Ensure stdout/stderr use UTF-8 on Windows consoles to avoid logging errors
+import sys
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+# Ensure logs directory exists
+os.makedirs('logs', exist_ok=True)
+
 # Setup logging
 logging.basicConfig(
     level=os.getenv('LOG_LEVEL', 'INFO'),
@@ -175,21 +188,39 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def list_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List all monitored accounts"""
     accounts = await bot.get_live_accounts()
-    
+
+    # Determine where to send the reply: message or callback_query.message
+    target = None
+    if hasattr(update, 'message') and update.message:
+        target = update.message
+    elif hasattr(update, 'callback_query') and update.callback_query and update.callback_query.message:
+        target = update.callback_query.message
+
     if not accounts:
-        await update.message.reply_text("❌ Aucun compte en cours de monitoring.")
+        if target:
+            await target.reply_text("❌ Aucun compte en cours de monitoring.")
         return
-    
+
     message = "📋 **Comptes en Monitoring:**\n\n"
     for i, acc in enumerate(accounts, 1):
         status = "🔴 LIVE" if acc.get('is_live') else "⚪ Offline"
         last_check = acc.get('last_checked', 'Jamais')
         if last_check != 'Jamais' and last_check:
             last_check = str(last_check).split('T')[1].split('.')[0] if 'T' in str(last_check) else str(last_check)
-        
+
         message += f"{i}. @{acc['username']} - {status} (Vérif: {last_check})\n"
-    
-    await update.message.reply_text(message, parse_mode='Markdown')
+
+    # If called from a CallbackQuery, prefer editing the message or answering the query
+    if hasattr(update, 'callback_query') and update.callback_query:
+        query = update.callback_query
+        if query.message:
+            await query.edit_message_text(message, parse_mode='Markdown')
+        else:
+            await query.answer(message, show_alert=True)
+        return
+
+    if target:
+        await target.reply_text(message, parse_mode='Markdown')
 
 async def add_account_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Add account command"""
