@@ -11,6 +11,9 @@ from datetime import datetime
 from dotenv import load_dotenv
 from pathlib import Path
 import yt_dlp
+import threading
+import subprocess
+import signal
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -58,7 +61,7 @@ MONITOR_INTERVAL = 300  # 5 minutes
 WAITING_FOR_USERNAME = 1
 
 # Download tracking - maps chat_id to active download info
-active_downloads = {}  # {chat_id: {'username': str, 'stop_flag': bool, 'filepath': str}}
+# {chat_id: {'username': str, 'stop_flag': bool, 'filepath': str, 'thread': Thread, 'process': Popen}}
 
 class TikTokLiveBot:
     def __init__(self, db: TikTokDatabase):
@@ -141,34 +144,21 @@ class TikTokLiveBot:
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 self.logger.info(f"Starting download for {username}...")
-                
-                # Hook to check for stop flag periodically
-                def progress_hook(d):
-                    if d['status'] == 'downloading':
-                        if chat_id and chat_id in active_downloads and active_downloads[chat_id].get('stop_flag'):
-                            raise Exception('Download interrupted by user')
-                    return False
-                
-                ydl.add_progress_hook(progress_hook)
-                
                 info = ydl.extract_info(url, download=True)
                 filepath = ydl.prepare_filename(info)
                 self.logger.info(f"Downloaded: {filepath}")
                 return filepath
         
         except Exception as e:
-            # If interrupted, try to find partial file
-            if 'interrupted' in str(e).lower():
-                self.logger.info(f"Download interrupted by user for {username}")
-                files = []
-                if os.path.exists('downloads'):
-                    files = [f for f in os.listdir('downloads') if f.startswith(username)]
-                if files:
-                    # Return the most recent partial file
-                    filepath = os.path.join('downloads', sorted(files)[-1])
-                    self.logger.info(f"Found partial file: {filepath}")
-                    return filepath
             self.logger.error(f"Error downloading live from {username}: {e}")
+            return None
+    
+    def download_live_sync(self, username: str, chat_id: int = None) -> str:
+        """Synchronous wrapper for download_live (runs in thread)"""
+        try:
+            return asyncio.run(self.download_live(username, chat_id))
+        except Exception as e:
+            self.logger.error(f"Error in download_live_sync: {e}")
             return None
 
 # Initialize bot
@@ -344,6 +334,11 @@ async def download_live_command(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("⚠️ Nom d'utilisateur invalide.")
         return
     
+    # Check if download already in progress
+    if chat_id in active_downloads:
+        await update.message.reply_text("⚠️ Un téléchargement est déjà en cours. Utilisez `/stop_download` pour l'arrêter.")
+        return
+    
     # Notify user that download is starting
     msg = await update.message.reply_text(
         f"⏳ Téléchargement du live de @{username}...\n\n"
@@ -351,24 +346,67 @@ async def download_live_command(update: Update, context: ContextTypes.DEFAULT_TY
         "Tapez `/stop_download` pour arrêter"
     )
     
+    # Function to run download in thread
+    def run_download():
+        try:
+            filepath = bot.download_live_sync(username, chat_id)
+            active_downloads[chat_id]['filepath'] = filepath
+            active_downloads[chat_id]['completed'] = True
+        except Exception as e:
+            logger.error(f"Download thread error: {e}")
+            active_downloads[chat_id]['error'] = str(e)
+    
     # Track this download
+    download_thread = threading.Thread(target=run_download, daemon=False)
+    download_thread.start()
+    
     active_downloads[chat_id] = {
         'username': username,
         'stop_flag': False,
         'filepath': None,
-        'message_id': msg.message_id
+        'message_id': msg.message_id,
+        'thread': download_thread,
+        'completed': False,
+        'error': None
     }
     
-    try:
-        filepath = await bot.download_live(username, chat_id)
+    # Wait for download to complete or be stopped
+    await asyncio.sleep(0.5)  # Give thread a moment to start
+    
+    max_wait = 3600  # 1 hour max
+    elapsed = 0
+    check_interval = 2
+    
+    while elapsed < max_wait:
+        if chat_id not in active_downloads:
+            break
+            
+        dl_info = active_downloads[chat_id]
         
-        if filepath:
-            active_downloads[chat_id]['filepath'] = filepath
-            
-            # Check if it was stopped (partial file)
-            file_size = os.path.getsize(filepath) if os.path.exists(filepath) else 0
-            was_stopped = active_downloads[chat_id].get('stop_flag', False)
-            
+        if dl_info.get('stop_flag') or dl_info.get('completed') or dl_info.get('error'):
+            break
+        
+        await asyncio.sleep(check_interval)
+        elapsed += check_interval
+    
+    # Process result
+    if chat_id not in active_downloads:
+        return
+    
+    dl_info = active_downloads[chat_id]
+    filepath = dl_info.get('filepath')
+    was_stopped = dl_info.get('stop_flag', False)
+    error = dl_info.get('error')
+    
+    try:
+        if error:
+            await msg.edit_text(
+                f"❌ Erreur: {error}\n\n"
+                "Vérifiez que le compte est en live.",
+                parse_mode='Markdown'
+            )
+        elif filepath and os.path.exists(filepath):
+            file_size = os.path.getsize(filepath)
             status_text = "⏸️ Arrêté" if was_stopped else "✅"
             
             # Try to send the file
@@ -409,12 +447,7 @@ async def download_live_command(update: Update, context: ContextTypes.DEFAULT_TY
                 parse_mode='Markdown'
             )
     except Exception as e:
-        logger.error(f"Error downloading live: {e}")
-        await msg.edit_text(
-            f"❌ Erreur: {str(e)}\n\n"
-            "Vérifiez que le compte est en live.",
-            parse_mode='Markdown'
-        )
+        logger.error(f"Error processing download result: {e}")
     finally:
         # Clean up tracking
         if chat_id in active_downloads:
@@ -440,6 +473,9 @@ async def stop_download_command(update: Update, context: ContextTypes.DEFAULT_TY
         "Le fichier partiellement téléchargé sera envoyé.",
         parse_mode='Markdown'
     )
+    
+    # Wait a bit for the download to stop
+    await asyncio.sleep(3)
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle button clicks"""
