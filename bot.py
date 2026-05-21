@@ -57,6 +57,9 @@ MONITOR_INTERVAL = 300  # 5 minutes
 # Conversation states
 WAITING_FOR_USERNAME = 1
 
+# Download tracking - maps chat_id to active download info
+active_downloads = {}  # {chat_id: {'username': str, 'stop_flag': bool, 'filepath': str}}
+
 class TikTokLiveBot:
     def __init__(self, db: TikTokDatabase):
         self.monitor = TikTokMonitor()
@@ -120,8 +123,8 @@ class TikTokLiveBot:
         
         return live_accounts
     
-    async def download_live(self, username: str) -> str:
-        """Download the live stream"""
+    async def download_live(self, username: str, chat_id: int = None) -> str:
+        """Download the live stream with cancellation support"""
         try:
             url = f"https://www.tiktok.com/@{username}/live"
             
@@ -130,18 +133,41 @@ class TikTokLiveBot:
                 'quiet': False,
                 'no_warnings': False,
                 'outtmpl': f'downloads/%(username)s_%(id)s.%(ext)s',
+                'socket_timeout': 10,
+                'fragment_timeout': 10,
             }
             
             os.makedirs('downloads', exist_ok=True)
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 self.logger.info(f"Starting download for {username}...")
+                
+                # Hook to check for stop flag periodically
+                def progress_hook(d):
+                    if d['status'] == 'downloading':
+                        if chat_id and chat_id in active_downloads and active_downloads[chat_id].get('stop_flag'):
+                            raise Exception('Download interrupted by user')
+                    return False
+                
+                ydl.add_progress_hook(progress_hook)
+                
                 info = ydl.extract_info(url, download=True)
                 filepath = ydl.prepare_filename(info)
                 self.logger.info(f"Downloaded: {filepath}")
                 return filepath
         
         except Exception as e:
+            # If interrupted, try to find partial file
+            if 'interrupted' in str(e).lower():
+                self.logger.info(f"Download interrupted by user for {username}")
+                files = []
+                if os.path.exists('downloads'):
+                    files = [f for f in os.listdir('downloads') if f.startswith(username)]
+                if files:
+                    # Return the most recent partial file
+                    filepath = os.path.join('downloads', sorted(files)[-1])
+                    self.logger.info(f"Found partial file: {filepath}")
+                    return filepath
             self.logger.error(f"Error downloading live from {username}: {e}")
             return None
 
@@ -177,11 +203,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /remove_account - Retirer un compte TikTok
 /list_accounts - Voir tous les comptes monitores
 /status - Voir le statut du monitoring
+/download_live - Télécharger un live TikTok
+/stop_download - Arrêter le téléchargement en cours
 /help - Cette aide
 
 **Commandes rapides:**
 /add username - Ajouter directement un compte
 /remove username - Retirer directement un compte
+/download_live @username - Télécharger un live
+/download @username - Alias court pour /download_live
     """
     await update.message.reply_text(help_text, parse_mode='Markdown')
 
@@ -293,6 +323,123 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     
     await update.message.reply_text(status_text, parse_mode='Markdown')
+
+async def download_live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Download a live stream"""
+    chat_id = update.effective_chat.id
+    
+    if not context.args:
+        await update.message.reply_text(
+            "📥 **Télécharger un Live TikTok**\n\n"
+            "Utilisation: `/download_live @username`\n\n"
+            "Exemple: `/download_live @tiktok`\n\n"
+            "Pour arrêter le téléchargement: `/stop_download`",
+            parse_mode='Markdown'
+        )
+        return
+    
+    username = context.args[0].lstrip('@').strip()
+    
+    if not username:
+        await update.message.reply_text("⚠️ Nom d'utilisateur invalide.")
+        return
+    
+    # Notify user that download is starting
+    msg = await update.message.reply_text(
+        f"⏳ Téléchargement du live de @{username}...\n\n"
+        "Cela peut prendre quelques minutes...\n\n"
+        "Tapez `/stop_download` pour arrêter"
+    )
+    
+    # Track this download
+    active_downloads[chat_id] = {
+        'username': username,
+        'stop_flag': False,
+        'filepath': None,
+        'message_id': msg.message_id
+    }
+    
+    try:
+        filepath = await bot.download_live(username, chat_id)
+        
+        if filepath:
+            active_downloads[chat_id]['filepath'] = filepath
+            
+            # Check if it was stopped (partial file)
+            file_size = os.path.getsize(filepath) if os.path.exists(filepath) else 0
+            was_stopped = active_downloads[chat_id].get('stop_flag', False)
+            
+            status_text = "⏸️ Arrêté" if was_stopped else "✅"
+            
+            # Try to send the file
+            try:
+                with open(filepath, 'rb') as f:
+                    await msg.edit_text(f"📥 Envoi du fichier {status_text}...", parse_mode='Markdown')
+                    await update.message.reply_document(f)
+                
+                # Clean up - delete the file after sending
+                try:
+                    os.remove(filepath)
+                except Exception as e:
+                    logger.warning(f"Could not delete file {filepath}: {e}")
+                
+                await msg.edit_text(
+                    f"{status_text} Live de @{username} téléchargé et envoyé!\n\n"
+                    f"📁 Fichier: `{os.path.basename(filepath)}`\n"
+                    f"📊 Taille: `{file_size / (1024*1024):.1f}MB`",
+                    parse_mode='Markdown'
+                )
+            except Exception as e:
+                # If file sending fails (too large, etc), just report the path
+                logger.error(f"Could not send file: {e}")
+                await msg.edit_text(
+                    f"{status_text} Live de @{username} téléchargé!\n\n"
+                    f"📁 Fichier: `{filepath}`\n"
+                    f"📊 Taille: `{file_size / (1024*1024):.1f}MB`\n"
+                    f"⚠️ Trop volumineux pour Telegram (limite: 50MB)",
+                    parse_mode='Markdown'
+                )
+        else:
+            await msg.edit_text(
+                f"❌ Impossible de télécharger le live de @{username}.\n\n"
+                "Possible causes:\n"
+                "• Le compte n'est pas en live maintenant\n"
+                "• Le compte n'existe pas\n"
+                "• Erreur réseau",
+                parse_mode='Markdown'
+            )
+    except Exception as e:
+        logger.error(f"Error downloading live: {e}")
+        await msg.edit_text(
+            f"❌ Erreur: {str(e)}\n\n"
+            "Vérifiez que le compte est en live.",
+            parse_mode='Markdown'
+        )
+    finally:
+        # Clean up tracking
+        if chat_id in active_downloads:
+            del active_downloads[chat_id]
+
+async def stop_download_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stop current download"""
+    chat_id = update.effective_chat.id
+    
+    if chat_id not in active_downloads:
+        await update.message.reply_text(
+            "❌ Aucun téléchargement en cours pour ce chat.",
+            parse_mode='Markdown'
+        )
+        return
+    
+    # Set the stop flag
+    active_downloads[chat_id]['stop_flag'] = True
+    username = active_downloads[chat_id].get('username', 'inconnu')
+    
+    await update.message.reply_text(
+        f"⏹️ Arrêt du téléchargement de @{username}...\n\n"
+        "Le fichier partiellement téléchargé sera envoyé.",
+        parse_mode='Markdown'
+    )
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle button clicks"""
@@ -424,6 +571,10 @@ def main():
     app.add_handler(CommandHandler('status', status_command))
     app.add_handler(CommandHandler('add', add_account_command))
     app.add_handler(CommandHandler('remove', remove_account_command))
+    app.add_handler(CommandHandler('download_live', download_live_command))
+    app.add_handler(CommandHandler('download', download_live_command))
+    app.add_handler(CommandHandler('stop_download', stop_download_command))
+    app.add_handler(CommandHandler('stop', stop_download_command))
     app.add_handler(conv_handler)
     app.add_handler(CallbackQueryHandler(button_callback))
     
