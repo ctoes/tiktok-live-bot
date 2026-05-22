@@ -7,7 +7,7 @@ Monitors TikTok accounts for live streams and sends them to Telegram
 import os
 import logging
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from pathlib import Path
 import yt_dlp
@@ -133,7 +133,7 @@ class TikTokLiveBot:
         os.makedirs('downloads', exist_ok=True)
         os.makedirs(os.path.join('logs', 'recordings'), exist_ok=True)
 
-        timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
         output_prefix = os.path.join('downloads', f'{username}_{timestamp}')
         output_template = f'{output_prefix}.%(ext)s'
         log_path = os.path.join('logs', 'recordings', f'{username}_{chat_id}_{timestamp}.log')
@@ -237,6 +237,12 @@ class TikTokLiveBot:
             return proc
         except Exception as e:
             self.logger.error(f"Failed to start recording for @{username}: {e}")
+            # Clean up log file if not already assigned to active_recordings
+            if chat_id not in active_recordings:
+                try:
+                    log_file.close()
+                except Exception:
+                    pass
             active_recordings.pop(chat_id, None)
             return None
 
@@ -581,7 +587,7 @@ async def monitor_recording_session(application: Application, chat_id: int, user
         last_error_check = 0
         while proc and proc.poll() is None:
             # Check logs every 5 seconds for critical errors
-            current_time = datetime.utcnow().timestamp()
+            current_time = datetime.now(timezone.utc).timestamp()
             if current_time - last_error_check > 5 and log_path and os.path.exists(log_path):
                 last_error_check = current_time
                 try:
@@ -653,9 +659,8 @@ async def monitor_recording_session(application: Application, chat_id: int, user
                 f"❌ Impossible de trouver le fichier pour @{username}.\n\n"
                 f"{failure_hint}"
                 f"Vérifiez que @{username} était vraiment en live.\n\n"
-                f"Code de sortie: `{return_code}`"
-                f"{error_details}",
-                parse_mode='Markdown'
+                f"Code de sortie: {return_code}"
+                f"{error_details}"
             )
             return
 
@@ -675,17 +680,15 @@ async def monitor_recording_session(application: Application, chat_id: int, user
 
             await msg.edit_text(
                 f"{status_text} Live de @{username} terminé!\n\n"
-                f"📁 Fichier: `{os.path.basename(filepath)}`\n"
-                f"📊 Taille: `{file_size / (1024*1024):.1f}MB`",
-                parse_mode='Markdown'
+                f"📁 Fichier: {os.path.basename(filepath)}\n"
+                f"📊 Taille: {file_size / (1024*1024):.1f}MB"
             )
         except Exception as e:
             logger.error(f"Could not send file: {e}")
             await msg.edit_text(
                 f"{status_text} Live de @{username} terminé mais l'envoi a échoué.\n\n"
-                f"📁 Fichier: `{filepath}`\n"
-                f"📊 Taille: `{file_size / (1024*1024):.1f}MB`",
-                parse_mode='Markdown'
+                f"📁 Fichier: {filepath}\n"
+                f"📊 Taille: {file_size / (1024*1024):.1f}MB"
             )
     finally:
         log_file = session.get('log_file') if session else None
@@ -724,9 +727,8 @@ async def download_live_command(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
         msg = await update.message.reply_text(
-            f"🔎 Vérification de `@{username}`...\n\n"
-            f"Je retente quelques fois si TikTok répond trop tôt hors live.",
-            parse_mode='Markdown'
+            f"🔎 Vérification de @{username}...\n\n"
+            f"Je retente quelques fois si TikTok répond trop tôt hors live."
         )
 
         live_result = await wait_for_live_status(username)
@@ -735,14 +737,12 @@ async def download_live_command(update: Update, context: ContextTypes.DEFAULT_TY
         if not live_result or not live_result.get('is_live'):
             await msg.edit_text(
                 f"⚠️ @{username} n'a pas pu être confirmé comme live.\n\n"
-                "Je tente quand même le téléchargement direct, car TikTok peut renvoyer un faux négatif.",
-                parse_mode='Markdown'
+                "Je tente quand même le téléchargement direct, car TikTok peut renvoyer un faux négatif."
             )
 
         await msg.edit_text(
-            f"🔴 Recording `@{username}`...\n\n"
-            f"Envoyez `/stop` pour couper et récupérer le fichier.",
-            parse_mode='Markdown'
+            f"🔴 Recording @{username}...\n\n"
+            f"Envoyez /stop pour couper et récupérer le fichier."
         )
 
         logger.info(f"Starting recording process for {username}")
@@ -751,8 +751,7 @@ async def download_live_command(update: Update, context: ContextTypes.DEFAULT_TY
             logger.warning(f"Failed to start recording process for {username}")
             await msg.edit_text(
                 f"❌ Impossible de démarrer l'enregistrement pour @{username}.\n\n"
-                "Le flux live n'a pas pu être résolu.",
-                parse_mode='Markdown'
+                "Le flux live n'a pas pu être résolu."
             )
             return
 
