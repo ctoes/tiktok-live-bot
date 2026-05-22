@@ -30,9 +30,30 @@ class FakeYDL:
         }
 
 
+def fake_resolve_live_info_sync(self, username, retry_count=2):
+    return {
+        'username': username,
+        'is_live': True,
+        'timestamp': '2026-01-01T00:00:00',
+        'room_id': '1234567890',
+        'stream_info': {
+            'stream_id': 'live123',
+            'title': 'Mock Live',
+            'viewers': 42,
+            'cover_image': 'https://example.com/thumb.jpg',
+            'stream_url': 'https://example.com/stream.m3u8',
+            'live_status': 'is_live',
+            'room_id': '1234567890',
+        },
+        'error': None,
+        'source': 'webcast',
+    }
+
+
 async def main():
-    original = monitor_module.yt_dlp.YoutubeDL
+    original = monitor_module.TikTokMonitor.resolve_live_info_sync
     monitor_module.yt_dlp.YoutubeDL = FakeYDL
+    monitor_module.TikTokMonitor.resolve_live_info_sync = fake_resolve_live_info_sync
     try:
         monitor = monitor_module.TikTokMonitor()
         result = await monitor.check_live_status('beautybasetv')
@@ -42,7 +63,8 @@ async def main():
         assert result['stream_info']['viewers'] == 42, 'bad viewers'
         print('PASS: live detection mock returns live')
     finally:
-        monitor_module.yt_dlp.YoutubeDL = original
+        monitor_module.yt_dlp.YoutubeDL = FakeYDL if False else original
+        monitor_module.TikTokMonitor.resolve_live_info_sync = original
 
 
 if __name__ == '__main__':

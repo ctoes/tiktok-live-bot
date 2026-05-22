@@ -22,10 +22,10 @@ class TikTokDatabase:
                 max_size=20,
                 command_timeout=60
             )
-            logger.info("✅ Connected to Neon PostgreSQL")
+            logger.info("Connected to Neon PostgreSQL")
             await self._create_tables()
         except Exception as e:
-            logger.error(f"❌ Failed to connect to database: {e}")
+            logger.error(f"Failed to connect to database: {e}")
             raise
     
     async def disconnect(self):
@@ -75,7 +75,7 @@ class TikTokDatabase:
                 );
             ''')
             
-            logger.info("✅ Database tables initialized")
+            logger.info("Database tables initialized")
     
     # ACCOUNT OPERATIONS
     
@@ -87,13 +87,13 @@ class TikTokDatabase:
                     '''INSERT INTO accounts (username) VALUES ($1)''',
                     username.lower()
                 )
-            logger.info(f"✅ Added account: {username}")
+            logger.info(f"Added account: {username}")
             return True
         except asyncpg.UniqueViolationError:
-            logger.warning(f"⚠️  Account {username} already exists")
+            logger.warning(f"Account {username} already exists")
             return False
         except Exception as e:
-            logger.error(f"❌ Error adding account {username}: {e}")
+            logger.error(f"Error adding account {username}: {e}")
             return False
     
     async def remove_account(self, username: str) -> bool:
@@ -107,13 +107,13 @@ class TikTokDatabase:
             
             # Check if any rows were deleted
             if result.endswith('1'):
-                logger.info(f"✅ Removed account: {username}")
+                logger.info(f"Removed account: {username}")
                 return True
             else:
-                logger.warning(f"⚠️  Account {username} not found")
+                logger.warning(f"Account {username} not found")
                 return False
         except Exception as e:
-            logger.error(f"❌ Error removing account {username}: {e}")
+            logger.error(f"Error removing account {username}: {e}")
             return False
     
     async def get_all_accounts(self) -> List[Dict]:

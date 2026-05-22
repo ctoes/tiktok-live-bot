@@ -42,13 +42,13 @@ except Exception:
 os.makedirs('logs', exist_ok=True)
 
 # Setup logging
+# Setup logging with UTF-8 file handler and stdout stream handler
+file_handler = logging.FileHandler('logs/bot.log', encoding='utf-8')
+stream_handler = logging.StreamHandler(sys.stdout)
 logging.basicConfig(
     level=os.getenv('LOG_LEVEL', 'INFO'),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('logs/bot.log'),
-        logging.StreamHandler()
-    ]
+    handlers=[file_handler, stream_handler]
 )
 logger = logging.getLogger(__name__)
 
@@ -80,14 +80,14 @@ class TikTokLiveBot:
         
         success = await self.db.add_account(username)
         if success:
-            self.logger.info(f"✅ Added account: {username}")
+              self.logger.info(f"Added account: {username}")
         return success
     
     async def remove_account(self, username: str) -> bool:
         """Remove a TikTok account from monitoring"""
         success = await self.db.remove_account(username)
         if success:
-            self.logger.info(f"✅ Removed account: {username}")
+              self.logger.info(f"Removed account: {username}")
         return success
     
     async def get_live_accounts(self) -> list:
@@ -117,14 +117,14 @@ class TikTokLiveBot:
                 # Check if this is a new live session
                 if username not in self.active_lives:
                     self.active_lives.add(username)
-                    self.logger.info(f"🎬 NEW LIVE: {username}")
+                    self.logger.info(f"NEW LIVE: {username}")
             else:
                 # Mark as not live if it was before
                 await self.db.update_account_status(username, False)
                 
                 if username in self.active_lives:
                     self.active_lives.discard(username)
-                    self.logger.info(f"🛑 LIVE ENDED: {username}")
+                    self.logger.info(f"LIVE ENDED: {username}")
         
         return live_accounts
     
@@ -138,8 +138,46 @@ class TikTokLiveBot:
         output_template = f'{output_prefix}.%(ext)s'
         log_path = os.path.join('logs', 'recordings', f'{username}_{chat_id}_{timestamp}.log')
 
+        # Prepare log file early so direct-recording path can reference it
+        log_file = open(log_path, 'w', encoding='utf-8')
+
         try:
             url = f"https://www.tiktok.com/@{username}/live"
+            try:
+                direct_stream_url = self.monitor.resolve_live_stream_url_sync(username)
+                if direct_stream_url:
+                    url = direct_stream_url
+                    self.logger.info(f"Using direct TikTok stream URL for @{username}")
+            except Exception as e:
+                self.logger.debug(f"Could not resolve direct stream URL for @{username}: {e}")
+
+            # If we have a direct CDN URL, prefer a lightweight direct recorder
+            if url and (url.startswith('http') and ('pull' in url or url.endswith('.flv') or '.m3u8' in url)):
+                try:
+                    out_file_path = f"{output_prefix}.flv"
+                    thread = threading.Thread(
+                        target=self._direct_recording_worker,
+                        args=(username, url, out_file_path, chat_id),
+                        daemon=True,
+                    )
+                    thread.start()
+
+                    active_recordings[chat_id] = {
+                        'username': username,
+                        'process': None,
+                        'thread': thread,
+                        'stop_flag': False,
+                        'filepath': output_prefix,
+                        'output_path': out_file_path,
+                        'log_path': log_path,
+                        'log_file': log_file,
+                        'task': None,
+                    }
+                    self.logger.info(f"Direct recording thread started for @{username}")
+                    return None
+                except Exception as e:
+                    self.logger.warning(f"Direct recording failed for @{username}: {e}. Falling back to yt-dlp.")
+
             cmd = [
                 sys.executable,
                 '-m', 'yt_dlp',
@@ -148,14 +186,36 @@ class TikTokLiveBot:
                 '-o', output_template,
                 '--no-part',
                 '--newline',
-                '--retries', 'infinite',
-                '--fragment-retries', 'infinite',
-                '--wait-for-video', '1',
-                '--live-from-start',
+                '--retries', '20',
+                '--fragment-retries', '20',
+                '--extractor-retries', '30',
+                '--retry-sleep', 'extractor:5',
+                '--socket-timeout', '30',
+                '--http-chunk-size', '10485760',
+                '--concurrent-fragments', '4',
                 '--merge-output-format', 'mp4',
             ]
+
+            # Adapt options for HLS vs FLV streams
+            if url and '.m3u8' in url.lower():
+                # HLS streams: don't try to start from beginning
+                cmd.extend(['--no-live-from-start'])
+            elif url and ('.flv' in url.lower() or 'pull-flv' in url):
+                # FLV streams can handle --live-from-start (if available)
+                pass
+
+            cookies_file = os.getenv('TIKTOK_COOKIES_FILE')
+            if cookies_file and os.path.exists(cookies_file):
+                cmd.extend(['--cookies', cookies_file])
+                self.logger.info(f"Using TikTok cookies file: {cookies_file}")
+            else:
+                self.logger.warning(
+                    'No TIKTOK_COOKIES_FILE configured; TikTok may return false offline results for some lives.'
+                )
+
             creationflags = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
-            log_file = open(log_path, 'w', encoding='utf-8')
+            self.logger.info(f"Starting recording for @{username} with command: {' '.join(cmd)}")
+
             proc = subprocess.Popen(
                 cmd,
                 stdout=log_file,
@@ -173,6 +233,7 @@ class TikTokLiveBot:
                 'log_file': log_file,
                 'task': None,
             }
+            self.logger.info(f"Recording process started for @{username} (PID: {proc.pid})")
             return proc
         except Exception as e:
             self.logger.error(f"Failed to start recording for @{username}: {e}")
@@ -187,8 +248,19 @@ class TikTokLiveBot:
 
         session['stop_flag'] = True
         proc = session.get('process')
-        if not proc:
-            return False
+        thread = session.get('thread')
+
+        # If we started a direct recording thread, join it after signalling stop
+        if thread is not None:
+            try:
+                # Wait a short time for the thread to stop
+                thread.join(timeout=5)
+            except Exception as e:
+                self.logger.debug(f"Error joining direct recording thread: {e}")
+
+        if proc is None:
+            # No subprocess to terminate when using direct thread
+            return True
 
         try:
             if proc.poll() is None:
@@ -204,6 +276,57 @@ class TikTokLiveBot:
                 pass
 
         return True
+
+    def _direct_recording_worker(self, username: str, live_url: str, out_path: str, chat_id: int):
+        """Background thread worker that writes stream chunks to disk using monitor.download_live_stream."""
+        try:
+            os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+        except Exception:
+            pass
+
+        try:
+            with open(out_path, 'wb') as out_file:
+                for chunk in self.monitor.download_live_stream(live_url):
+                    # Stop if requested
+                    session = active_recordings.get(chat_id)
+                    if not session or session.get('stop_flag'):
+                        break
+                    try:
+                        out_file.write(chunk)
+                    except Exception:
+                        break
+        except Exception as e:
+            self.logger.error(f"Direct recording error for @{username}: {e}")
+        finally:
+            self.logger.info(f"Direct recording finished for @{username}: {out_path}")
+            # Attempt to convert to mp4 using ffmpeg if available
+            try:
+                mp4_path = out_path.rsplit('.', 1)[0] + '.mp4'
+                self.convert_flv_to_mp4(out_path, mp4_path)
+                # Update recorded path in active_recordings
+                session = active_recordings.get(chat_id)
+                if session:
+                    session['output_path'] = mp4_path
+            except Exception as e:
+                self.logger.debug(f"FFmpeg conversion skipped/failed: {e}")
+
+    def convert_flv_to_mp4(self, src: str, dst: str) -> bool:
+        """Convert an FLV file to MP4 using system ffmpeg. Returns True on success."""
+        try:
+            # Prefer ffmpeg on PATH
+            cmd = [
+                'ffmpeg',
+                '-y',
+                '-i', src,
+                '-c', 'copy',
+                dst,
+            ]
+            import subprocess
+            result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return result.returncode == 0
+        except Exception as e:
+            self.logger.debug(f"convert_flv_to_mp4 failed: {e}")
+            return False
 
     def find_recorded_file(self, output_prefix: str) -> str | None:
         """Find the recorded file or partial file for a session output prefix."""
@@ -304,7 +427,15 @@ async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def rec_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """TikRec-style alias for immediate recording"""
-    await download_live_command(update, context)
+    try:
+        logger.info(f"/rec command received from {update.effective_user.id}: {context.args}")
+        await download_live_command(update, context)
+    except Exception as e:
+        logger.error(f"Error in rec_command: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Erreur: {str(e)}")
+        except Exception as send_error:
+            logger.error(f"Could not send error message: {send_error}")
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """TikRec-style alias for stop"""
@@ -421,13 +552,19 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def wait_for_live_status(username: str, retries: int = 6, interval_seconds: int = 5):
     """Retry live detection for a short period to avoid TikTok false negatives."""
+    logger.info(f"Checking live status for @{username} (retries: {retries}, interval: {interval_seconds}s)")
     last_result = None
     for attempt in range(retries):
+        logger.debug(f"  Attempt {attempt + 1}/{retries} for @{username}")
         last_result = await bot.monitor.check_live_status(username)
         if last_result and last_result.get('is_live'):
+            logger.info(f"@{username} is LIVE after {attempt + 1} attempts")
             return last_result
         if attempt < retries - 1:
+            logger.debug(f"  @{username} not live, waiting {interval_seconds}s before retry...")
             await asyncio.sleep(interval_seconds)
+    
+    logger.info(f"@{username} not detected as live after {retries} attempts")
     return last_result
 
 async def monitor_recording_session(application: Application, chat_id: int, username: str, msg):
@@ -438,6 +575,42 @@ async def monitor_recording_session(application: Application, chat_id: int, user
             return
 
         proc = session.get('process')
+        log_path = session.get('log_path')
+        
+        # Monitor process in background for errors
+        last_error_check = 0
+        while proc and proc.poll() is None:
+            # Check logs every 5 seconds for critical errors
+            current_time = datetime.utcnow().timestamp()
+            if current_time - last_error_check > 5 and log_path and os.path.exists(log_path):
+                last_error_check = current_time
+                try:
+                    with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        log_content = f.read()
+                    
+                    # Check for fatal errors that should stop the recording
+                    fatal_errors = [
+                        'The channel is not currently live',
+                        'The channel is offline',
+                        'No video formats found',
+                        'ERROR: [tiktok:live]',
+                        'ERROR: Unable to download video',
+                    ]
+                    
+                    for error in fatal_errors:
+                        if error in log_content:
+                            logger.warning(f"Fatal error detected in logs: {error}")
+                            proc.terminate()
+                            try:
+                                proc.wait(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                proc.kill()
+                            break
+                except Exception as e:
+                    logger.debug(f"Error checking logs: {e}")
+            
+            await asyncio.sleep(1)
+        
         if proc:
             await asyncio.to_thread(proc.wait)
         return_code = proc.returncode if proc else None
@@ -449,22 +622,37 @@ async def monitor_recording_session(application: Application, chat_id: int, user
         output_prefix = session.get('output_path') or session.get('filepath')
         filepath = bot.find_recorded_file(output_prefix) if output_prefix else None
         stopped = session.get('stop_flag', False)
-        log_path = session.get('log_path')
 
         if not filepath or not os.path.exists(filepath):
             error_details = ""
+            likely_blocked = False
             if log_path and os.path.exists(log_path):
                 try:
                     with open(log_path, 'r', encoding='utf-8', errors='ignore') as log_file:
-                        tail = log_file.read()[-1500:]
+                        tail = log_file.read()[-2000:]
+                    likely_blocked = any(marker in tail for marker in (
+                        'The channel is not currently live',
+                        'status_code":4003110',
+                        'statusCode":4003110',
+                        'live detail API is deprecated',
+                        'TikTok is requiring login',
+                    ))
                     if tail.strip():
                         error_details = f"\n\nLog:\n```\n{tail[-1000:]}\n```"
                 except Exception:
                     pass
 
+            failure_hint = (
+                "TikTok a probablement bloqué l'accès à ce live ou renvoyé un faux négatif.\n"
+                "Si cela continue, fournissez un fichier de cookies TikTok via `TIKTOK_COOKIES_FILE`.\n"
+            ) if likely_blocked else (
+                "Le live n'était peut-être pas disponible au moment du démarrage, ou la résolution du flux a échoué.\n"
+            )
+
             await msg.edit_text(
                 f"❌ Impossible de trouver le fichier pour @{username}.\n\n"
-                f"Le live n'était peut-être pas disponible, ou la résolution du flux a échoué.\n"
+                f"{failure_hint}"
+                f"Vérifiez que @{username} était vraiment en live.\n\n"
                 f"Code de sortie: `{return_code}`"
                 f"{error_details}",
                 parse_mode='Markdown'
@@ -510,60 +698,76 @@ async def monitor_recording_session(application: Application, chat_id: int, user
 
 async def download_live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start recording a live stream immediately."""
-    chat_id = update.effective_chat.id
+    try:
+        chat_id = update.effective_chat.id
+        logger.info(f"download_live_command called for chat {chat_id} with args: {context.args}")
 
-    if not context.args:
-        await update.message.reply_text(
-            "📥 **TikTok Live Recorder**\n\n"
-            "Utilisation: `/download_live @username` ou `/rec @username`\n\n"
-            "Pour arrêter: `/stop_download` ou `/stop`\n"
-            "Pour auto-enregistrer les futurs lives: `/watch @username`",
+        if not context.args:
+            await update.message.reply_text(
+                "📥 **TikTok Live Recorder**\n\n"
+                "Utilisation: `/download_live @username` ou `/rec @username`\n\n"
+                "Pour arrêter: `/stop_download` ou `/stop`\n"
+                "Pour auto-enregistrer les futurs lives: `/watch @username`",
+                parse_mode='Markdown'
+            )
+            return
+
+        username = context.args[0].lstrip('@').strip()
+        logger.info(f"Processing download_live for username: {username}")
+        
+        if not username:
+            await update.message.reply_text("⚠️ Nom d'utilisateur invalide.")
+            return
+
+        if chat_id in active_recordings:
+            await update.message.reply_text("⚠️ Un enregistrement est déjà en cours. Utilisez `/stop` pour l'arrêter.")
+            return
+
+        msg = await update.message.reply_text(
+            f"🔎 Vérification de `@{username}`...\n\n"
+            f"Je retente quelques fois si TikTok répond trop tôt hors live.",
             parse_mode='Markdown'
         )
-        return
 
-    username = context.args[0].lstrip('@').strip()
-    if not username:
-        await update.message.reply_text("⚠️ Nom d'utilisateur invalide.")
-        return
+        live_result = await wait_for_live_status(username)
+        logger.info(f"Live status result for {username}: {live_result.get('is_live') if live_result else 'None'}")
 
-    if chat_id in active_recordings:
-        await update.message.reply_text("⚠️ Un enregistrement est déjà en cours. Utilisez `/stop` pour l'arrêter.")
-        return
+        if not live_result or not live_result.get('is_live'):
+            await msg.edit_text(
+                f"⚠️ @{username} n'a pas pu être confirmé comme live.\n\n"
+                "Je tente quand même le téléchargement direct, car TikTok peut renvoyer un faux négatif.",
+                parse_mode='Markdown'
+            )
 
-    msg = await update.message.reply_text(
-        f"🔎 Vérification de `@{username}`...\n\n"
-        f"Je retente quelques fois si TikTok répond trop tôt hors live.",
-        parse_mode='Markdown'
-    )
-
-    live_result = await wait_for_live_status(username)
-    if not live_result or not live_result.get('is_live'):
         await msg.edit_text(
-            f"❌ @{username} n'est pas détecté comme live pour le moment.\n\n"
-            "Si la personne vient juste de démarrer le live, réessaie dans 10 à 20 secondes.",
+            f"🔴 Recording `@{username}`...\n\n"
+            f"Envoyez `/stop` pour couper et récupérer le fichier.",
             parse_mode='Markdown'
         )
-        return
 
-    await msg.edit_text(
-        f"🔴 Recording `@{username}`...\n\n"
-        f"Envoyez `/stop` pour couper et récupérer le fichier.",
-        parse_mode='Markdown'
-    )
+        logger.info(f"Starting recording process for {username}")
+        proc = await asyncio.to_thread(bot.start_recording_process, username, chat_id)
+        if not proc:
+            logger.warning(f"Failed to start recording process for {username}")
+            await msg.edit_text(
+                f"❌ Impossible de démarrer l'enregistrement pour @{username}.\n\n"
+                "Le flux live n'a pas pu être résolu.",
+                parse_mode='Markdown'
+            )
+            return
 
-    proc = await asyncio.to_thread(bot.start_recording_process, username, chat_id)
-    if not proc:
-        await msg.edit_text(
-            f"❌ Impossible de démarrer l'enregistrement pour @{username}.\n\n"
-            "Le flux live n'a pas pu être résolu.",
-            parse_mode='Markdown'
+        logger.info(f"Recording started, creating monitoring task for {username}")
+        active_recordings[chat_id]['task'] = context.application.create_task(
+            monitor_recording_session(context.application, chat_id, username, msg)
         )
-        return
+        logger.info(f"Recording task created for {username}")
 
-    active_recordings[chat_id]['task'] = context.application.create_task(
-        monitor_recording_session(context.application, chat_id, username, msg)
-    )
+    except Exception as e:
+        logger.error(f"Error in download_live_command: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ Erreur durant le téléchargement: {str(e)[:100]}")
+        except Exception as send_error:
+            logger.error(f"Could not send error message: {send_error}")
 
 async def stop_download_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Stop current recording."""
@@ -669,7 +873,7 @@ async def monitoring_loop(application: Application):
     """Main monitoring loop - checks accounts every 5 minutes"""
     while True:
         try:
-            logger.info("🔍 Vérification des comptes...")
+            logger.info("Verifying accounts...")
             live_accounts = await bot.check_all_accounts()
             
             if live_accounts:
@@ -710,7 +914,7 @@ async def monitoring_loop(application: Application):
                                     )
                                 else:
                                     await notification_msg.edit_text(
-                                        f"❌ Impossible de démarrer l'enregistrement automatique pour @{username}.",
+                                            f"Impossible de démarrer l'enregistrement automatique pour @{username}.",
                                         parse_mode='Markdown'
                                     )
                     except Exception as e:
@@ -730,34 +934,47 @@ async def post_init(application: Application):
         
         # Start monitoring loop
         asyncio.create_task(monitoring_loop(application))
-        logger.info("✅ Bot démarré et prêt à monitorer!")
+        logger.info("Bot started and ready to monitor")
     except Exception as e:
-        logger.error(f"❌ Erreur lors de l'initialisation: {e}")
+        logger.error(f"Erreur lors de l'initialisation: {e}")
         raise
 
 def main():
     """Start the bot"""
     global app, bot
     
+    logger.info("Initializing TikTok Live Monitor Bot...")
+    
     if not TOKEN or TOKEN == 'your_telegram_bot_token_here':
-        logger.error("❌ TELEGRAM_BOT_TOKEN non configuré dans .env")
+        logger.error("TELEGRAM_BOT_TOKEN non configuré dans .env")
         return
     
     if not DATABASE_URL or DATABASE_URL == 'your_database_url_here':
-        logger.error("❌ DATABASE_URL non configuré dans .env")
+        logger.error("DATABASE_URL non configuré dans .env")
         return
     
-    # Initialize database
-    db = TikTokDatabase(DATABASE_URL)
-    
-    # Initialize bot with database
-    bot = TikTokLiveBot(db)
-    
-    # Create application
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
-    
-    # Store db reference in app for shutdown
-    app.bot_db = db
+    try:
+        # Initialize database
+        logger.info("Initializing database...")
+        db = TikTokDatabase(DATABASE_URL)
+        logger.info("Database initialized")
+        
+        # Initialize bot with database
+        logger.info("Creating TikTokLiveBot instance...")
+        bot = TikTokLiveBot(db)
+        logger.info("Bot instance created")
+        
+        # Create application
+        logger.info("Creating Telegram application...")
+        app = Application.builder().token(TOKEN).post_init(post_init).build()
+        logger.info("Application created")
+        
+        # Store db reference in app for shutdown
+        app.bot_db = db
+        
+    except Exception as e:
+        logger.error(f"Error initializing bot: {e}", exc_info=True)
+        return
     
     # Add conversation handler for adding accounts
     conv_handler = ConversationHandler(
@@ -772,6 +989,7 @@ def main():
     )
     
     # Add handlers
+    logger.info("Adding command handlers...")
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('help', help_command))
     app.add_handler(CommandHandler('list_accounts', list_accounts))
@@ -787,10 +1005,24 @@ def main():
     app.add_handler(CommandHandler('watch_account', watch_command))
     app.add_handler(conv_handler)
     app.add_handler(CallbackQueryHandler(button_callback))
+    logger.info("All handlers registered")
     
     # Run bot
-    logger.info("🚀 Démarrage du TikTok Live Monitor Bot...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Starting polling loop...")
+    try:
+        app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=None)
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Error running bot: {e}", exc_info=True)
 
 if __name__ == '__main__':
-    main()
+    try:
+        logger.info("=" * 60)
+        logger.info("TikTok Live Monitor Bot starting...")
+        logger.info("=" * 60)
+        main()
+    except Exception as e:
+        logger.error(f"FATAL ERROR: {e}", exc_info=True)
+        import sys
+        sys.exit(1)
