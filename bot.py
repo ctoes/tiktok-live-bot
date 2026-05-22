@@ -281,9 +281,9 @@ async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"👀 @{username} ajouté à la watchlist.")
 
-    # If the user is already live, auto-record immediately
+    # If the user is already live, auto-record immediately with a short retry window
     try:
-        result = await bot.monitor.check_live_status(username)
+        result = await wait_for_live_status(username, retries=2, interval_seconds=3)
         if result and result.get('is_live') and CHAT_ID and CHAT_ID not in active_recordings:
             msg = await update.message.reply_text(
                 f"🔴 @{username} est déjà en live. Enregistrement automatique démarré.",
@@ -419,6 +419,17 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(status_text, parse_mode='Markdown')
 
+async def wait_for_live_status(username: str, retries: int = 6, interval_seconds: int = 5):
+    """Retry live detection for a short period to avoid TikTok false negatives."""
+    last_result = None
+    for attempt in range(retries):
+        last_result = await bot.monitor.check_live_status(username)
+        if last_result and last_result.get('is_live'):
+            return last_result
+        if attempt < retries - 1:
+            await asyncio.sleep(interval_seconds)
+    return last_result
+
 async def monitor_recording_session(application: Application, chat_id: int, username: str, msg):
     """Wait for a recording process to finish, then send the file."""
     try:
@@ -429,6 +440,7 @@ async def monitor_recording_session(application: Application, chat_id: int, user
         proc = session.get('process')
         if proc:
             await asyncio.to_thread(proc.wait)
+        return_code = proc.returncode if proc else None
 
         session = active_recordings.get(chat_id)
         if not session:
@@ -452,7 +464,8 @@ async def monitor_recording_session(application: Application, chat_id: int, user
 
             await msg.edit_text(
                 f"❌ Impossible de trouver le fichier pour @{username}.\n\n"
-                "Le live n'était peut-être pas disponible, ou la résolution du flux a échoué."
+                f"Le live n'était peut-être pas disponible, ou la résolution du flux a échoué.\n"
+                f"Code de sortie: `{return_code}`"
                 f"{error_details}",
                 parse_mode='Markdown'
             )
@@ -519,6 +532,21 @@ async def download_live_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     msg = await update.message.reply_text(
+        f"🔎 Vérification de `@{username}`...\n\n"
+        f"Je retente quelques fois si TikTok répond trop tôt hors live.",
+        parse_mode='Markdown'
+    )
+
+    live_result = await wait_for_live_status(username)
+    if not live_result or not live_result.get('is_live'):
+        await msg.edit_text(
+            f"❌ @{username} n'est pas détecté comme live pour le moment.\n\n"
+            "Si la personne vient juste de démarrer le live, réessaie dans 10 à 20 secondes.",
+            parse_mode='Markdown'
+        )
+        return
+
+    await msg.edit_text(
         f"🔴 Recording `@{username}`...\n\n"
         f"Envoyez `/stop` pour couper et récupérer le fichier.",
         parse_mode='Markdown'

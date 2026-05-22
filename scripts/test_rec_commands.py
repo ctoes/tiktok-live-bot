@@ -47,6 +47,18 @@ class FakeContext:
 
 
 class FakeBotLogic:
+    def __init__(self):
+        class Monitor:
+            async def check_live_status(self, username):
+                return {
+                    'username': username,
+                    'is_live': True,
+                    'timestamp': '2026-05-22T00:00:00',
+                    'stream_info': {'title': 'Fake Live', 'viewers': 1},
+                }
+
+        self.monitor = Monitor()
+
     def start_recording_process(self, username, chat_id):
         process = type('P', (), {'wait': lambda self: None, 'poll': lambda self: 0, 'terminate': lambda self: None})()
         bot_module.active_recordings[chat_id] = {
