@@ -15,7 +15,6 @@ import threading
 import subprocess
 import signal
 import glob
-import shutil
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -129,59 +128,32 @@ class TikTokLiveBot:
         
         return live_accounts
     
-    def resolve_stream_url(self, username: str) -> str:
-        """Resolve the direct live stream URL with yt-dlp."""
-        url = f"https://www.tiktok.com/@{username}/live"
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'skip_download': True,
-            'noplaylist': True,
-            'format': 'best',
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-
-        stream_url = info.get('url')
-        if not stream_url and info.get('formats'):
-            best_format = max(
-                info['formats'],
-                key=lambda fmt: fmt.get('tbr') or fmt.get('height') or 0,
-            )
-            stream_url = best_format.get('url')
-
-        if not stream_url:
-            raise RuntimeError(f"Impossible de résoudre le flux live pour @{username}")
-
-        return stream_url
-
-    def build_record_command(self, stream_url: str, output_path: str) -> list:
-        """Build the ffmpeg command used to record a live stream."""
-        ffmpeg_path = shutil.which('ffmpeg') or 'ffmpeg'
-        return [
-            ffmpeg_path,
-            '-y',
-            '-nostdin',
-            '-loglevel', 'warning',
-            '-i', stream_url,
-            '-c', 'copy',
-            '-movflags', '+faststart',
-            output_path,
-        ]
-
     def start_recording_process(self, username: str, chat_id: int) -> subprocess.Popen | None:
-        """Start an ffmpeg recording process so it can be stopped."""
+        """Start a yt-dlp recording process so it can be stopped."""
         os.makedirs('downloads', exist_ok=True)
         os.makedirs(os.path.join('logs', 'recordings'), exist_ok=True)
 
         timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-        output_path = os.path.join('downloads', f'{username}_{timestamp}.mp4')
+        output_prefix = os.path.join('downloads', f'{username}_{timestamp}')
+        output_template = f'{output_prefix}.%(ext)s'
         log_path = os.path.join('logs', 'recordings', f'{username}_{chat_id}_{timestamp}.log')
 
         try:
-            stream_url = self.resolve_stream_url(username)
-            cmd = self.build_record_command(stream_url, output_path)
+            url = f"https://www.tiktok.com/@{username}/live"
+            cmd = [
+                sys.executable,
+                '-m', 'yt_dlp',
+                url,
+                '-f', 'best',
+                '-o', output_template,
+                '--no-part',
+                '--newline',
+                '--retries', 'infinite',
+                '--fragment-retries', 'infinite',
+                '--wait-for-video', '1',
+                '--live-from-start',
+                '--merge-output-format', 'mp4',
+            ]
             creationflags = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
             log_file = open(log_path, 'w', encoding='utf-8')
             proc = subprocess.Popen(
@@ -195,8 +167,8 @@ class TikTokLiveBot:
                 'username': username,
                 'process': proc,
                 'stop_flag': False,
-                'filepath': output_path,
-                'output_path': output_path,
+                'filepath': output_prefix,
+                'output_path': output_prefix,
                 'log_path': log_path,
                 'log_file': log_file,
                 'task': None,
@@ -233,9 +205,9 @@ class TikTokLiveBot:
 
         return True
 
-    def find_recorded_file(self, username: str) -> str | None:
-        """Find the most recent recorded file for a username."""
-        pattern = os.path.join('downloads', f'{username}_*.*')
+    def find_recorded_file(self, output_prefix: str) -> str | None:
+        """Find the recorded file or partial file for a session output prefix."""
+        pattern = f'{output_prefix}*'
         matches = glob.glob(pattern)
         if not matches:
             return None
@@ -249,15 +221,18 @@ app = None
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command"""
     keyboard = [
-        [InlineKeyboardButton("➕ Ajouter Compte", callback_data='add')],
-        [InlineKeyboardButton("➖ Retirer Compte", callback_data='remove')],
-        [InlineKeyboardButton("📋 Lister Comptes", callback_data='list')],
+        [InlineKeyboardButton("🔴 REC", callback_data='rec')],
+        [InlineKeyboardButton("👁 WATCH", callback_data='watch')],
+        [InlineKeyboardButton("⏹ STOP", callback_data='stop')],
+        [InlineKeyboardButton("📊 STATUS", callback_data='status')],
+        [InlineKeyboardButton("📋 LIST", callback_data='list')],
+        [InlineKeyboardButton("❓ HELP", callback_data='help')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        "🎬 **TikTok Live Monitor Bot**\n\n"
-        "Je monitore les comptes TikTok et vous envoie les lives sur Telegram.\n\n"
+        "🎬 **TikTok Live Recorder Bot**\n\n"
+        "Style TikRec: enregistrer, surveiller, stopper et recevoir les lives sur Telegram.\n\n"
         "Choisissez une action:",
         reply_markup=reply_markup,
         parse_mode='Markdown'
@@ -459,7 +434,8 @@ async def monitor_recording_session(application: Application, chat_id: int, user
         if not session:
             return
 
-        filepath = session.get('output_path') or session.get('filepath') or bot.find_recorded_file(username)
+        output_prefix = session.get('output_path') or session.get('filepath')
+        filepath = bot.find_recorded_file(output_prefix) if output_prefix else None
         stopped = session.get('stop_flag', False)
         log_path = session.get('log_path')
 
@@ -565,18 +541,23 @@ async def stop_download_command(update: Update, context: ContextTypes.DEFAULT_TY
     """Stop current recording."""
     chat_id = update.effective_chat.id
     session = active_recordings.get(chat_id)
+    target = update.message
+    if not target and hasattr(update, 'callback_query') and update.callback_query:
+        target = update.callback_query.message
 
     if not session:
-        await update.message.reply_text("❌ Aucun enregistrement en cours pour ce chat.")
+        if target:
+            await target.reply_text("❌ Aucun enregistrement en cours pour ce chat.")
         return
 
     username = session.get('username', 'inconnu')
     bot.stop_recording_process(chat_id)
-    await update.message.reply_text(
-        f"⏹️ Arrêt demandé pour @{username}.\n\n"
-        "Je récupère le fichier partiel si disponible...",
-        parse_mode='Markdown'
-    )
+    if target:
+        await target.reply_text(
+            f"⏹️ Arrêt demandé pour @{username}.\n\n"
+            "Je récupère le fichier partiel si disponible...",
+            parse_mode='Markdown'
+        )
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle button clicks"""
@@ -586,6 +567,54 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == 'add':
         await query.edit_message_text("Envoyez le nom d'utilisateur TikTok à ajouter:")
         return WAITING_FOR_USERNAME
+    elif query.data == 'rec':
+        await query.edit_message_text(
+            "🔴 **REC**\n\n"
+            "Utilisez la commande:\n"
+            "`/rec @username`\n\n"
+            "Exemple: `/rec frank.the.fonk`",
+            parse_mode='Markdown'
+        )
+    elif query.data == 'watch':
+        await query.edit_message_text(
+            "👁 **WATCH**\n\n"
+            "Utilisez la commande:\n"
+            "`/watch @username`\n\n"
+            "Le bot enregistrera automatiquement les prochains lives.",
+            parse_mode='Markdown'
+        )
+    elif query.data == 'stop':
+        await stop_download_command(update, context)
+    elif query.data == 'status':
+        accounts = await bot.get_live_accounts()
+        live_count = len([a for a in accounts if a.get('is_live')])
+        total_count = len(accounts)
+        await query.edit_message_text(
+            f"📊 **Statut du Bot:**\n\n"
+            f"✅ Bot en ligne\n"
+            f"📡 Vérification: Toutes les {MONITOR_INTERVAL}s\n"
+            f"📺 Comptes monitores: {total_count}\n"
+            f"🔴 Comptes en live: {live_count}",
+            parse_mode='Markdown'
+        )
+    elif query.data == 'help':
+        await query.edit_message_text(
+            "🎬 **Commandes Disponibles:**\n\n"
+            "/start - Menu principal\n"
+            "/rec - Enregistrer un live TikTok maintenant\n"
+            "/watch - Ajouter un compte à surveiller et auto-enregistrer ses prochains lives\n"
+            "/stop - Arrêter l'enregistrement en cours\n"
+            "/status - Voir le statut du monitoring\n"
+            "/list_accounts - Voir tous les comptes monitores\n"
+            "/help - Cette aide\n\n"
+            "**Commandes rapides:**\n"
+            "/add username - Ajouter directement un compte\n"
+            "/remove username - Retirer directement un compte\n"
+            "/rec @username - Enregistrer immédiatement le live\n"
+            "/watch @username - Ajouter à la watchlist\n"
+            "/stop - Arrêter l'enregistrement",
+            parse_mode='Markdown'
+        )
     elif query.data == 'remove':
         accounts = await bot.get_live_accounts()
         if not accounts:

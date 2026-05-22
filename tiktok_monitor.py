@@ -1,8 +1,8 @@
-import requests
 import logging
 from datetime import datetime
 from typing import Optional, Dict, List
-import json
+import asyncio
+import yt_dlp
 
 logger = logging.getLogger(__name__)
 
@@ -10,10 +10,6 @@ class TikTokMonitor:
     """Monitor TikTok accounts for live streams"""
     
     def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
         self.live_urls = {}
     
     async def check_live_status(self, username: str) -> Optional[Dict]:
@@ -22,31 +18,11 @@ class TikTokMonitor:
         Returns: Dict with live info if live, None otherwise
         """
         try:
-            # Method 1: Direct API call via unofficial endpoint
-            url = f"https://www.tiktok.com/api/user/@{username}/video"
-            
-            params = {
-                'aid': '1988',
-                'app_name': 'tiktok_web',
-                'device_id': '1234567890',
-                'region': 'US',
-                'priority_region': 'US'
-            }
-            
-            response = self.session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            
-            data = response.json()
-            
-            # Check if user is currently live
-            if self._check_if_live(data):
+            data = await asyncio.to_thread(self._check_live_sync, username)
+
+            if data and data.get('is_live'):
                 logger.info(f"✓ {username} is LIVE")
-                return {
-                    'username': username,
-                    'is_live': True,
-                    'timestamp': datetime.now().isoformat(),
-                    'stream_info': self._extract_stream_info(data)
-                }
+                return data
             else:
                 logger.debug(f"✗ {username} is not live")
                 return {
@@ -58,58 +34,51 @@ class TikTokMonitor:
         except Exception as e:
             logger.error(f"Error checking {username}: {str(e)}")
             return None
-    
-    def _check_if_live(self, data: dict) -> bool:
-        """Check if the response indicates a live stream"""
-        try:
-            # Look for live indicators in the response
-            if 'user' in data:
-                user_info = data['user']
-                # Check for live status indicators
-                if user_info.get('is_live', False):
-                    return True
-                if user_info.get('status', {}).get('is_live', False):
-                    return True
-            return False
-        except Exception as e:
-            logger.error(f"Error parsing live status: {e}")
-            return False
-    
-    def _extract_stream_info(self, data: dict) -> Dict:
-        """Extract stream information from response"""
-        try:
-            stream_info = {
-                'stream_id': None,
-                'title': None,
-                'viewers': None,
-                'cover_image': None,
-                'stream_url': None
-            }
-            
-            if 'user' in data:
-                user = data['user']
-                stream_info['stream_id'] = user.get('id')
-                stream_info['title'] = user.get('live_title', 'TikTok Live')
-                stream_info['viewers'] = user.get('live_viewer_count', 0)
-                stream_info['cover_image'] = user.get('avatar_medium', {}).get('url_list', [None])[0]
-            
-            return stream_info
-        except Exception as e:
-            logger.error(f"Error extracting stream info: {e}")
-            return {}
+
+    def _check_live_sync(self, username: str) -> Dict:
+        """Synchronous live status probe using yt-dlp."""
+        url = f"https://www.tiktok.com/@{username}/live"
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'skip_download': True,
+            'noplaylist': True,
+            'extract_flat': False,
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        live_status = info.get('live_status')
+        is_live = bool(info.get('is_live')) or live_status in ('is_live', 'live')
+
+        stream_info = {
+            'stream_id': info.get('id'),
+            'title': info.get('title') or info.get('description') or 'TikTok Live',
+            'viewers': info.get('concurrent_view_count') or info.get('view_count') or info.get('live_viewer_count'),
+            'cover_image': info.get('thumbnail'),
+            'stream_url': info.get('url') or info.get('webpage_url'),
+            'live_status': live_status,
+        }
+
+        return {
+            'username': username,
+            'is_live': is_live,
+            'timestamp': datetime.now().isoformat(),
+            'stream_info': stream_info,
+        }
     
     async def get_live_stream_url(self, username: str) -> Optional[str]:
         """Get the direct stream URL for downloading"""
         try:
-            # This would use yt-dlp or similar to extract the actual stream URL
-            # For now, we return a placeholder
-            url = f"https://www.tiktok.com/@{username}/live"
-            return url
+            data = await asyncio.to_thread(self._check_live_sync, username)
+            if data and data.get('is_live'):
+                return data.get('stream_info', {}).get('stream_url')
+            return None
         except Exception as e:
             logger.error(f"Error getting stream URL for {username}: {e}")
             return None
     
     def close(self):
         """Close the session"""
-        if self.session:
-            self.session.close()
+        return None
