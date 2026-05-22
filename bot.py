@@ -14,6 +14,8 @@ import yt_dlp
 import threading
 import subprocess
 import signal
+import glob
+import shutil
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -60,8 +62,9 @@ MONITOR_INTERVAL = 300  # 5 minutes
 # Conversation states
 WAITING_FOR_USERNAME = 1
 
-# Download tracking - maps chat_id to active download info
-# {chat_id: {'username': str, 'stop_flag': bool, 'filepath': str, 'thread': Thread, 'process': Popen}}
+# Recording tracking - maps chat_id to active recording info
+# {chat_id: {'username': str, 'process': Popen, 'output_prefix': str, 'stop_flag': bool, 'task': Task}}
+active_recordings = {}
 
 class TikTokLiveBot:
     def __init__(self, db: TikTokDatabase):
@@ -126,59 +129,117 @@ class TikTokLiveBot:
         
         return live_accounts
     
-    async def download_live(self, username: str, chat_id: int = None) -> str:
-        """Download the live stream with cancellation support"""
+    def resolve_stream_url(self, username: str) -> str:
+        """Resolve the direct live stream URL with yt-dlp."""
+        url = f"https://www.tiktok.com/@{username}/live"
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'skip_download': True,
+            'noplaylist': True,
+            'format': 'best',
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        stream_url = info.get('url')
+        if not stream_url and info.get('formats'):
+            best_format = max(
+                info['formats'],
+                key=lambda fmt: fmt.get('tbr') or fmt.get('height') or 0,
+            )
+            stream_url = best_format.get('url')
+
+        if not stream_url:
+            raise RuntimeError(f"Impossible de résoudre le flux live pour @{username}")
+
+        return stream_url
+
+    def build_record_command(self, stream_url: str, output_path: str) -> list:
+        """Build the ffmpeg command used to record a live stream."""
+        ffmpeg_path = shutil.which('ffmpeg') or 'ffmpeg'
+        return [
+            ffmpeg_path,
+            '-y',
+            '-nostdin',
+            '-loglevel', 'warning',
+            '-i', stream_url,
+            '-c', 'copy',
+            '-movflags', '+faststart',
+            output_path,
+        ]
+
+    def start_recording_process(self, username: str, chat_id: int) -> subprocess.Popen | None:
+        """Start an ffmpeg recording process so it can be stopped."""
+        os.makedirs('downloads', exist_ok=True)
+        os.makedirs(os.path.join('logs', 'recordings'), exist_ok=True)
+
+        timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+        output_path = os.path.join('downloads', f'{username}_{timestamp}.mp4')
+        log_path = os.path.join('logs', 'recordings', f'{username}_{chat_id}_{timestamp}.log')
+
         try:
-            url = f"https://www.tiktok.com/@{username}/live"
-            
-            ydl_opts = {
-                'format': 'best',
-                'quiet': False,
-                'no_warnings': False,
-                'outtmpl': f'downloads/%(username)s_%(id)s.%(ext)s',
-                'socket_timeout': 10,
-                'fragment_timeout': 10,
+            stream_url = self.resolve_stream_url(username)
+            cmd = self.build_record_command(stream_url, output_path)
+            creationflags = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
+            log_file = open(log_path, 'w', encoding='utf-8')
+            proc = subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                creationflags=creationflags,
+            )
+
+            active_recordings[chat_id] = {
+                'username': username,
+                'process': proc,
+                'stop_flag': False,
+                'filepath': output_path,
+                'output_path': output_path,
+                'log_path': log_path,
+                'log_file': log_file,
+                'task': None,
             }
-            
-            os.makedirs('downloads', exist_ok=True)
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                self.logger.info(f"Starting download for {username}...")
-                info = ydl.extract_info(url, download=True)
-                filepath = ydl.prepare_filename(info)
-                self.logger.info(f"Downloaded: {filepath}")
-                return filepath
-        
+            return proc
         except Exception as e:
-            self.logger.error(f"Error downloading live from {username}: {e}")
+            self.logger.error(f"Failed to start recording for @{username}: {e}")
+            active_recordings.pop(chat_id, None)
             return None
-    
-    def download_live_blocking(self, username: str, chat_id: int = None) -> str:
-        """Blocking version for download_live (runs in thread)"""
+
+    def stop_recording_process(self, chat_id: int) -> bool:
+        """Stop an active recording process."""
+        session = active_recordings.get(chat_id)
+        if not session:
+            return False
+
+        session['stop_flag'] = True
+        proc = session.get('process')
+        if not proc:
+            return False
+
         try:
-            url = f"https://www.tiktok.com/@{username}/live"
-            
-            ydl_opts = {
-                'format': 'best',
-                'quiet': False,
-                'no_warnings': False,
-                'outtmpl': f'downloads/%(username)s_%(id)s.%(ext)s',
-                'socket_timeout': 10,
-                'fragment_timeout': 10,
-            }
-            
-            os.makedirs('downloads', exist_ok=True)
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                self.logger.info(f"Starting download for {username}...")
-                info = ydl.extract_info(url, download=True)
-                filepath = ydl.prepare_filename(info)
-                self.logger.info(f"Downloaded: {filepath}")
-                return filepath
-        
+            if proc.poll() is None:
+                proc.terminate()
         except Exception as e:
-            self.logger.error(f"Error downloading live from {username}: {e}")
+            self.logger.warning(f"Failed to terminate recording process: {e}")
+
+        log_file = session.get('log_file')
+        if log_file:
+            try:
+                log_file.flush()
+            except Exception:
+                pass
+
+        return True
+
+    def find_recorded_file(self, username: str) -> str | None:
+        """Find the most recent recorded file for a username."""
+        pattern = os.path.join('downloads', f'{username}_*.*')
+        matches = glob.glob(pattern)
+        if not matches:
             return None
+        return max(matches, key=os.path.getmtime)
 
 # Initialize bot
 bot = None
@@ -208,21 +269,71 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🎬 **Commandes Disponibles:**
 
 /start - Menu principal
-/add_account - Ajouter un compte TikTok
-/remove_account - Retirer un compte TikTok
-/list_accounts - Voir tous les comptes monitores
+/rec - Enregistrer un live TikTok maintenant
+/watch - Ajouter un compte à surveiller et auto-enregistrer ses prochains lives
+/stop - Arrêter l'enregistrement en cours
 /status - Voir le statut du monitoring
-/download_live - Télécharger un live TikTok
-/stop_download - Arrêter le téléchargement en cours
+/list_accounts - Voir tous les comptes monitores
 /help - Cette aide
 
 **Commandes rapides:**
 /add username - Ajouter directement un compte
 /remove username - Retirer directement un compte
-/download_live @username - Télécharger un live
-/download @username - Alias court pour /download_live
+/rec @username - Enregistrer immédiatement le live
+/watch @username - Ajouter à la watchlist
+/stop - Arrêter l'enregistrement
     """
     await update.message.reply_text(help_text, parse_mode='Markdown')
+
+async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add account to watchlist and auto-record if live now"""
+    if not context.args:
+        await update.message.reply_text(
+            "👀 Utilisation: `/watch @username`",
+            parse_mode='Markdown'
+        )
+        return
+
+    username = context.args[0].lstrip('@').strip()
+    if not username:
+        await update.message.reply_text("⚠️ Nom d'utilisateur invalide.")
+        return
+
+    success = await bot.add_account(username)
+    if not success:
+        await update.message.reply_text(f"❌ Le compte @{username} existe déjà ou est invalide.")
+        return
+
+    await update.message.reply_text(f"👀 @{username} ajouté à la watchlist.")
+
+    # If the user is already live, auto-record immediately
+    try:
+        result = await bot.monitor.check_live_status(username)
+        if result and result.get('is_live') and CHAT_ID and CHAT_ID not in active_recordings:
+            msg = await update.message.reply_text(
+                f"🔴 @{username} est déjà en live. Enregistrement automatique démarré.",
+                parse_mode='Markdown'
+            )
+            proc = await asyncio.to_thread(bot.start_recording_process, username, CHAT_ID)
+            if proc:
+                active_recordings[CHAT_ID]['task'] = context.application.create_task(
+                    monitor_recording_session(context.application, CHAT_ID, username, msg)
+                )
+            else:
+                await msg.edit_text(
+                    f"❌ Impossible de démarrer l'enregistrement automatique pour @{username}.",
+                    parse_mode='Markdown'
+                )
+    except Exception as e:
+        logger.warning(f"Watch command live check failed for @{username}: {e}")
+
+async def rec_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """TikRec-style alias for immediate recording"""
+    await download_live_command(update, context)
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """TikRec-style alias for stop"""
+    await stop_download_command(update, context)
 
 async def list_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List all monitored accounts"""
@@ -333,168 +444,139 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(status_text, parse_mode='Markdown')
 
-async def download_live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Download a live stream"""
-    chat_id = update.effective_chat.id
-    
-    if not context.args:
-        await update.message.reply_text(
-            "📥 **Télécharger un Live TikTok**\n\n"
-            "Utilisation: `/download_live @username`\n\n"
-            "Exemple: `/download_live @tiktok`\n\n"
-            "Pour arrêter le téléchargement: `/stop_download`",
-            parse_mode='Markdown'
-        )
-        return
-    
-    username = context.args[0].lstrip('@').strip()
-    
-    if not username:
-        await update.message.reply_text("⚠️ Nom d'utilisateur invalide.")
-        return
-    
-    # Check if download already in progress
-    if chat_id in active_downloads:
-        await update.message.reply_text("⚠️ Un téléchargement est déjà en cours. Utilisez `/stop_download` pour l'arrêter.")
-        return
-    
-    # Notify user that download is starting
-    msg = await update.message.reply_text(
-        f"⏳ Téléchargement du live de @{username}...\n\n"
-        "Cela peut prendre quelques minutes...\n\n"
-        "Tapez `/stop_download` pour arrêter"
-    )
-    
-    # Function to run download in thread
-    def run_download():
-        try:
-            filepath = bot.download_live_blocking(username, chat_id)
-            active_downloads[chat_id]['filepath'] = filepath
-            active_downloads[chat_id]['completed'] = True
-        except Exception as e:
-            logger.error(f"Download thread error: {e}")
-            active_downloads[chat_id]['error'] = str(e)
-    
-    # Track this download
-    download_thread = threading.Thread(target=run_download, daemon=False)
-    download_thread.start()
-    
-    active_downloads[chat_id] = {
-        'username': username,
-        'stop_flag': False,
-        'filepath': None,
-        'message_id': msg.message_id,
-        'thread': download_thread,
-        'completed': False,
-        'error': None
-    }
-    
-    # Wait for download to complete or be stopped
-    await asyncio.sleep(0.5)  # Give thread a moment to start
-    
-    max_wait = 3600  # 1 hour max
-    elapsed = 0
-    check_interval = 2
-    
-    while elapsed < max_wait:
-        if chat_id not in active_downloads:
-            break
-            
-        dl_info = active_downloads[chat_id]
-        
-        if dl_info.get('stop_flag') or dl_info.get('completed') or dl_info.get('error'):
-            break
-        
-        await asyncio.sleep(check_interval)
-        elapsed += check_interval
-    
-    # Process result
-    if chat_id not in active_downloads:
-        return
-    
-    dl_info = active_downloads[chat_id]
-    filepath = dl_info.get('filepath')
-    was_stopped = dl_info.get('stop_flag', False)
-    error = dl_info.get('error')
-    
+async def monitor_recording_session(application: Application, chat_id: int, username: str, msg):
+    """Wait for a recording process to finish, then send the file."""
     try:
-        if error:
+        session = active_recordings.get(chat_id)
+        if not session:
+            return
+
+        proc = session.get('process')
+        if proc:
+            await asyncio.to_thread(proc.wait)
+
+        session = active_recordings.get(chat_id)
+        if not session:
+            return
+
+        filepath = session.get('output_path') or session.get('filepath') or bot.find_recorded_file(username)
+        stopped = session.get('stop_flag', False)
+        log_path = session.get('log_path')
+
+        if not filepath or not os.path.exists(filepath):
+            error_details = ""
+            if log_path and os.path.exists(log_path):
+                try:
+                    with open(log_path, 'r', encoding='utf-8', errors='ignore') as log_file:
+                        tail = log_file.read()[-1500:]
+                    if tail.strip():
+                        error_details = f"\n\nLog:\n```\n{tail[-1000:]}\n```"
+                except Exception:
+                    pass
+
             await msg.edit_text(
-                f"❌ Erreur: {error}\n\n"
-                "Vérifiez que le compte est en live.",
+                f"❌ Impossible de trouver le fichier pour @{username}.\n\n"
+                "Le live n'était peut-être pas disponible, ou la résolution du flux a échoué."
+                f"{error_details}",
                 parse_mode='Markdown'
             )
-        elif filepath and os.path.exists(filepath):
-            file_size = os.path.getsize(filepath)
-            status_text = "⏸️ Arrêté" if was_stopped else "✅"
-            
-            # Try to send the file
-            try:
-                with open(filepath, 'rb') as f:
-                    await msg.edit_text(f"📥 Envoi du fichier {status_text}...", parse_mode='Markdown')
-                    await update.message.reply_document(f)
-                
-                # Clean up - delete the file after sending
+            return
+
+        file_size = os.path.getsize(filepath)
+        status_text = "⏸️ Arrêté" if stopped else "✅"
+
+        try:
+            await msg.edit_text(f"📥 Envoi du fichier {status_text}...", parse_mode='Markdown')
+            with open(filepath, 'rb') as f:
+                await application.bot.send_document(chat_id=chat_id, document=f)
+
+            if not stopped:
                 try:
                     os.remove(filepath)
                 except Exception as e:
                     logger.warning(f"Could not delete file {filepath}: {e}")
-                
-                await msg.edit_text(
-                    f"{status_text} Live de @{username} téléchargé et envoyé!\n\n"
-                    f"📁 Fichier: `{os.path.basename(filepath)}`\n"
-                    f"📊 Taille: `{file_size / (1024*1024):.1f}MB`",
-                    parse_mode='Markdown'
-                )
-            except Exception as e:
-                # If file sending fails (too large, etc), just report the path
-                logger.error(f"Could not send file: {e}")
-                await msg.edit_text(
-                    f"{status_text} Live de @{username} téléchargé!\n\n"
-                    f"📁 Fichier: `{filepath}`\n"
-                    f"📊 Taille: `{file_size / (1024*1024):.1f}MB`\n"
-                    f"⚠️ Trop volumineux pour Telegram (limite: 50MB)",
-                    parse_mode='Markdown'
-                )
-        else:
+
             await msg.edit_text(
-                f"❌ Impossible de télécharger le live de @{username}.\n\n"
-                "Possible causes:\n"
-                "• Le compte n'est pas en live maintenant\n"
-                "• Le compte n'existe pas\n"
-                "• Erreur réseau",
+                f"{status_text} Live de @{username} terminé!\n\n"
+                f"📁 Fichier: `{os.path.basename(filepath)}`\n"
+                f"📊 Taille: `{file_size / (1024*1024):.1f}MB`",
                 parse_mode='Markdown'
             )
-    except Exception as e:
-        logger.error(f"Error processing download result: {e}")
+        except Exception as e:
+            logger.error(f"Could not send file: {e}")
+            await msg.edit_text(
+                f"{status_text} Live de @{username} terminé mais l'envoi a échoué.\n\n"
+                f"📁 Fichier: `{filepath}`\n"
+                f"📊 Taille: `{file_size / (1024*1024):.1f}MB`",
+                parse_mode='Markdown'
+            )
     finally:
-        # Clean up tracking
-        if chat_id in active_downloads:
-            del active_downloads[chat_id]
+        log_file = session.get('log_file') if session else None
+        if log_file:
+            try:
+                log_file.close()
+            except Exception:
+                pass
+        active_recordings.pop(chat_id, None)
 
-async def stop_download_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stop current download"""
+async def download_live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start recording a live stream immediately."""
     chat_id = update.effective_chat.id
-    
-    if chat_id not in active_downloads:
+
+    if not context.args:
         await update.message.reply_text(
-            "❌ Aucun téléchargement en cours pour ce chat.",
+            "📥 **TikTok Live Recorder**\n\n"
+            "Utilisation: `/download_live @username` ou `/rec @username`\n\n"
+            "Pour arrêter: `/stop_download` ou `/stop`\n"
+            "Pour auto-enregistrer les futurs lives: `/watch @username`",
             parse_mode='Markdown'
         )
         return
-    
-    # Set the stop flag
-    active_downloads[chat_id]['stop_flag'] = True
-    username = active_downloads[chat_id].get('username', 'inconnu')
-    
-    await update.message.reply_text(
-        f"⏹️ Arrêt du téléchargement de @{username}...\n\n"
-        "Le fichier partiellement téléchargé sera envoyé.",
+
+    username = context.args[0].lstrip('@').strip()
+    if not username:
+        await update.message.reply_text("⚠️ Nom d'utilisateur invalide.")
+        return
+
+    if chat_id in active_recordings:
+        await update.message.reply_text("⚠️ Un enregistrement est déjà en cours. Utilisez `/stop` pour l'arrêter.")
+        return
+
+    msg = await update.message.reply_text(
+        f"🔴 Recording `@{username}`...\n\n"
+        f"Envoyez `/stop` pour couper et récupérer le fichier.",
         parse_mode='Markdown'
     )
-    
-    # Wait a bit for the download to stop
-    await asyncio.sleep(3)
+
+    proc = await asyncio.to_thread(bot.start_recording_process, username, chat_id)
+    if not proc:
+        await msg.edit_text(
+            f"❌ Impossible de démarrer l'enregistrement pour @{username}.\n\n"
+            "Le flux live n'a pas pu être résolu.",
+            parse_mode='Markdown'
+        )
+        return
+
+    active_recordings[chat_id]['task'] = context.application.create_task(
+        monitor_recording_session(context.application, chat_id, username, msg)
+    )
+
+async def stop_download_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stop current recording."""
+    chat_id = update.effective_chat.id
+    session = active_recordings.get(chat_id)
+
+    if not session:
+        await update.message.reply_text("❌ Aucun enregistrement en cours pour ce chat.")
+        return
+
+    username = session.get('username', 'inconnu')
+    bot.stop_recording_process(chat_id)
+    await update.message.reply_text(
+        f"⏹️ Arrêt demandé pour @{username}.\n\n"
+        "Je récupère le fichier partiel si disponible...",
+        parse_mode='Markdown'
+    )
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle button clicks"""
@@ -555,12 +637,25 @@ async def monitoring_loop(application: Application):
                     # Send to main chat
                     try:
                         if CHAT_ID:
-                            await application.bot.send_message(
+                            notification_msg = await application.bot.send_message(
                                 chat_id=CHAT_ID,
                                 text=message,
                                 parse_mode='Markdown',
                                 disable_web_page_preview=False
                             )
+
+                            # Auto-record the live if nothing is already recording for this chat
+                            if CHAT_ID not in active_recordings:
+                                proc = await asyncio.to_thread(bot.start_recording_process, username, CHAT_ID)
+                                if proc:
+                                    active_recordings[CHAT_ID]['task'] = application.create_task(
+                                        monitor_recording_session(application, CHAT_ID, username, notification_msg)
+                                    )
+                                else:
+                                    await notification_msg.edit_text(
+                                        f"❌ Impossible de démarrer l'enregistrement automatique pour @{username}.",
+                                        parse_mode='Markdown'
+                                    )
                     except Exception as e:
                         logger.error(f"Erreur d'envoi du message: {e}")
             
@@ -626,10 +721,13 @@ def main():
     app.add_handler(CommandHandler('status', status_command))
     app.add_handler(CommandHandler('add', add_account_command))
     app.add_handler(CommandHandler('remove', remove_account_command))
+    app.add_handler(CommandHandler('watch', watch_command))
+    app.add_handler(CommandHandler('rec', rec_command))
+    app.add_handler(CommandHandler('stop', stop_command))
     app.add_handler(CommandHandler('download_live', download_live_command))
     app.add_handler(CommandHandler('download', download_live_command))
     app.add_handler(CommandHandler('stop_download', stop_download_command))
-    app.add_handler(CommandHandler('stop', stop_download_command))
+    app.add_handler(CommandHandler('watch_account', watch_command))
     app.add_handler(conv_handler)
     app.add_handler(CallbackQueryHandler(button_callback))
     
